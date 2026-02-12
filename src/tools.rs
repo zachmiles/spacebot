@@ -46,6 +46,7 @@ pub use shell::{ShellTool, ShellArgs, ShellOutput, ShellError, ShellResult};
 pub use file::{FileTool, FileArgs, FileOutput, FileError, FileEntryOutput, FileEntry, FileType};
 pub use exec::{ExecTool, ExecArgs, ExecOutput, ExecError, ExecResult, EnvVar};
 
+use crate::agent::channel::ChannelState;
 use crate::memory::MemorySearch;
 use crate::{AgentId, ChannelId, OutboundResponse, ProcessEvent, WorkerId};
 use rig::tool::Tool as _;
@@ -67,21 +68,21 @@ pub fn create_channel_tool_server(memory_search: Arc<MemorySearch>) -> ToolServe
 
 /// Add per-channel tools to a running ToolServer.
 ///
-/// Called when a channel is created or a conversation turn begins. These tools hold
-/// per-channel state (channel_id, response sender, event bus) that can't be known
-/// at agent startup.
+/// Called when a conversation turn begins. These tools hold per-channel state
+/// (channel history, active branches/workers, response sender) that can't be
+/// known at agent startup. Cleaned up via `remove_channel_tools()` when the
+/// turn ends.
 pub async fn add_channel_tools(
     handle: &ToolServerHandle,
-    channel_id: ChannelId,
+    state: ChannelState,
     response_tx: mpsc::Sender<OutboundResponse>,
     conversation_id: impl Into<String>,
-    event_tx: mpsc::Sender<ProcessEvent>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     handle.add_tool(ReplyTool::new(response_tx, conversation_id)).await?;
-    handle.add_tool(BranchTool::new(channel_id.clone(), event_tx.clone())).await?;
-    handle.add_tool(SpawnWorkerTool::new(Some(channel_id.clone()), event_tx.clone())).await?;
-    handle.add_tool(RouteTool::new(channel_id.clone(), event_tx.clone())).await?;
-    handle.add_tool(CancelTool::new(channel_id, event_tx)).await?;
+    handle.add_tool(BranchTool::new(state.clone())).await?;
+    handle.add_tool(SpawnWorkerTool::new(state.clone())).await?;
+    handle.add_tool(RouteTool::new(state.clone())).await?;
+    handle.add_tool(CancelTool::new(state)).await?;
     Ok(())
 }
 

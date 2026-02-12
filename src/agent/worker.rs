@@ -1,9 +1,11 @@
 //! Worker: Independent task execution process.
 
 use crate::error::Result;
+use crate::llm::SpacebotModel;
 use crate::{WorkerId, ChannelId, ProcessId, ProcessType, AgentDeps};
 use crate::hooks::SpacebotHook;
-use std::sync::Arc;
+use rig::agent::AgentBuilder;
+use rig::completion::{CompletionModel, Prompt};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
@@ -119,27 +121,100 @@ impl Worker {
         Ok(())
     }
     
-    /// Run the worker until completion.
+    /// Run the worker's LLM agent loop until completion.
+    ///
+    /// Creates a per-worker ToolServer with shell, file, exec, and set_status tools.
+    /// For fire-and-forget workers, runs once and returns. For interactive workers,
+    /// waits for follow-up messages on input_rx and runs additional turns.
     pub async fn run(mut self) -> Result<String> {
-        // Update status
         self.status_tx.send_modify(|s| *s = "running".to_string());
         self.hook.send_status("running");
         
-        // In real implementation:
-        // 1. Create LLM agent with task-specific tools (shell, file, exec)
-        // 2. Run the agent loop with max_turns(50)
-        // 3. Handle interactive mode if input_rx is Some
-        // 4. Return the final result
-        
-        // For now, just simulate completion
-        tracing::info!(worker_id = %self.id, "worker running");
-        
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        
+        tracing::info!(worker_id = %self.id, task = %self.task, "worker starting");
+
+        // Create per-worker ToolServer with task tools
+        let worker_tool_server = crate::tools::create_worker_tool_server(
+            self.deps.agent_id.clone(),
+            self.id,
+            self.channel_id.clone(),
+            self.deps.event_tx.clone(),
+        );
+
+        let model_name = self.deps.routing.resolve(ProcessType::Worker, None).to_string();
+        let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
+            .with_routing(self.deps.routing.clone());
+
+        let agent = AgentBuilder::new(model)
+            .preamble(&self.system_prompt)
+            .default_max_turns(50)
+            .tool_server_handle(worker_tool_server)
+            .build();
+
+        // Fresh history for the worker (no channel context)
+        let mut history = Vec::new();
+
+        // Run the initial task
+        let result = match agent.prompt(&self.task)
+            .with_history(&mut history)
+            .with_hook(self.hook.clone())
+            .await
+        {
+            Ok(response) => response,
+            Err(rig::completion::PromptError::MaxTurnsError { .. }) => {
+                self.state = WorkerState::Done;
+                self.hook.send_status("completed (hit turn limit)");
+                let partial = extract_last_assistant_text(&history)
+                    .unwrap_or_else(|| "Worker exhausted its turns.".into());
+                tracing::warn!(worker_id = %self.id, "worker hit max turns");
+                return Ok(partial);
+            }
+            Err(rig::completion::PromptError::PromptCancelled { reason, .. }) => {
+                self.state = WorkerState::Failed;
+                self.hook.send_status("cancelled");
+                tracing::info!(worker_id = %self.id, %reason, "worker cancelled");
+                return Ok(format!("Worker cancelled: {reason}"));
+            }
+            Err(error) => {
+                self.state = WorkerState::Failed;
+                self.hook.send_status("failed");
+                tracing::error!(worker_id = %self.id, %error, "worker LLM call failed");
+                return Err(crate::error::AgentError::Other(error.into()).into());
+            }
+        };
+
+        // For interactive workers, enter a follow-up loop
+        if let Some(mut input_rx) = self.input_rx.take() {
+            self.state = WorkerState::WaitingForInput;
+            self.hook.send_status("waiting for input");
+
+            while let Some(follow_up) = input_rx.recv().await {
+                self.state = WorkerState::Running;
+                self.hook.send_status("processing follow-up");
+
+                match agent.prompt(&follow_up)
+                    .with_history(&mut history)
+                    .with_hook(self.hook.clone())
+                    .await
+                {
+                    Ok(_response) => {
+                        self.state = WorkerState::WaitingForInput;
+                        self.hook.send_status("waiting for input");
+                    }
+                    Err(error) => {
+                        tracing::error!(worker_id = %self.id, %error, "worker follow-up failed");
+                        self.state = WorkerState::Failed;
+                        self.hook.send_status("failed");
+                        break;
+                    }
+                }
+            }
+        }
+
         self.state = WorkerState::Done;
         self.hook.send_status("completed");
         
-        Ok(format!("Task completed: {}", self.task))
+        tracing::info!(worker_id = %self.id, "worker completed");
+        Ok(result)
     }
     
     /// Check if worker is in a terminal state.
@@ -151,4 +226,25 @@ impl Worker {
     pub fn is_interactive(&self) -> bool {
         self.input_rx.is_some()
     }
+}
+
+/// Extract the last assistant text message from a history.
+fn extract_last_assistant_text(history: &[rig::message::Message]) -> Option<String> {
+    for message in history.iter().rev() {
+        if let rig::message::Message::Assistant { content, .. } = message {
+            let texts: Vec<String> = content.iter()
+                .filter_map(|c| {
+                    if let rig::message::AssistantContent::Text(t) = c {
+                        Some(t.text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !texts.is_empty() {
+                return Some(texts.join("\n"));
+            }
+        }
+    }
+    None
 }

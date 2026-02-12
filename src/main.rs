@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
             memory_search,
             llm_manager: llm_manager.clone(),
             tool_server,
+            routing: agent_config.routing.clone(),
             event_tx,
         };
 

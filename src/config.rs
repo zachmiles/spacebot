@@ -29,6 +29,7 @@ pub struct Config {
 pub struct LlmConfig {
     pub anthropic_key: Option<String>,
     pub openai_key: Option<String>,
+    pub openrouter_key: Option<String>,
 }
 
 /// Defaults inherited by all agents. Individual agents can override any field.
@@ -213,6 +214,7 @@ struct TomlConfig {
 struct TomlLlmConfig {
     anthropic_key: Option<String>,
     openai_key: Option<String>,
+    openrouter_key: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -377,11 +379,12 @@ impl Config {
         let llm = LlmConfig {
             anthropic_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_key: std::env::var("OPENAI_API_KEY").ok(),
+            openrouter_key: std::env::var("OPENROUTER_API_KEY").ok(),
         };
 
-        if llm.anthropic_key.is_none() && llm.openai_key.is_none() {
+        if llm.anthropic_key.is_none() && llm.openai_key.is_none() && llm.openrouter_key.is_none() {
             return Err(ConfigError::Invalid(
-                "no LLM provider API key found — set ANTHROPIC_API_KEY or OPENAI_API_KEY".into(),
+                "no LLM provider API key found — set ANTHROPIC_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY".into(),
             )
             .into());
         }
@@ -431,11 +434,17 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            openrouter_key: toml
+                .llm
+                .openrouter_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok()),
         };
 
-        if llm.anthropic_key.is_none() && llm.openai_key.is_none() {
+        if llm.anthropic_key.is_none() && llm.openai_key.is_none() && llm.openrouter_key.is_none() {
             return Err(ConfigError::Invalid(
-                "no LLM provider API key found — set ANTHROPIC_API_KEY or OPENAI_API_KEY".into(),
+                "no LLM provider API key found — set ANTHROPIC_API_KEY, OPENAI_API_KEY, or OPENROUTER_API_KEY".into(),
             )
             .into());
         }

@@ -1,26 +1,22 @@
 //! Cancel tool for stopping workers or branches.
 
-use crate::{BranchId, ChannelId, ProcessEvent, WorkerId};
+use crate::agent::channel::ChannelState;
+use crate::{BranchId, WorkerId};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 /// Tool for canceling workers or branches.
 #[derive(Debug, Clone)]
 pub struct CancelTool {
-    channel_id: ChannelId,
-    event_tx: mpsc::Sender<ProcessEvent>,
+    state: ChannelState,
 }
 
 impl CancelTool {
-    /// Create a new cancel tool.
-    pub fn new(channel_id: ChannelId, event_tx: mpsc::Sender<ProcessEvent>) -> Self {
-        Self {
-            channel_id,
-            event_tx,
-        }
+    /// Create a new cancel tool with access to channel state.
+    pub fn new(state: ChannelState) -> Self {
+        Self { state }
     }
 }
 
@@ -63,7 +59,7 @@ impl Tool for CancelTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Cancel an active worker or branch. Use this to stop processes that are no longer needed, taking too long, or going in the wrong direction. Cancellation is immediate - the process will be terminated.".to_string(),
+            description: "Cancel an active worker or branch. Cancellation is immediate.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -87,42 +83,33 @@ impl Tool for CancelTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Parse the process ID
-        let process_id_parsed = match args.process_type.as_str() {
-            "worker" => args
-                .process_id
-                .parse::<WorkerId>()
-                .map_err(|e| CancelError(format!("Invalid worker ID: {e}")))?,
-            "branch" => args
-                .process_id
-                .parse::<BranchId>()
-                .map_err(|e| CancelError(format!("Invalid branch ID: {e}")))?,
-            _ => return Err(CancelError(format!("Unknown process type: {}", args.process_type))),
-        };
+        match args.process_type.as_str() {
+            "branch" => {
+                let branch_id = args.process_id.parse::<BranchId>()
+                    .map_err(|e| CancelError(format!("Invalid branch ID: {e}")))?;
+                let mut branches = self.state.active_branches.write().await;
+                if let Some(handle) = branches.remove(&branch_id) {
+                    handle.abort();
+                } else {
+                    return Err(CancelError(format!("Branch {branch_id} not found")));
+                }
+            }
+            "worker" => {
+                let worker_id = args.process_id.parse::<WorkerId>()
+                    .map_err(|e| CancelError(format!("Invalid worker ID: {e}")))?;
+                let mut workers = self.state.active_workers.write().await;
+                if workers.remove(&worker_id).is_none() {
+                    return Err(CancelError(format!("Worker {worker_id} not found")));
+                }
+                // The worker's tokio task will be dropped when the Worker struct is dropped
+            }
+            other => return Err(CancelError(format!("Unknown process type: {other}"))),
+        }
 
-        tracing::info!(
-            process_type = %args.process_type,
-            process_id = %process_id_parsed,
-            channel_id = %self.channel_id,
-            reason = ?args.reason,
-            "cancelling process"
-        );
-
-        // In real implementation:
-        // 1. Send cancellation signal to the process
-        // 2. Remove from active_workers or active_branches list
-        // 3. Send completion event (for workers) or just remove (for branches)
-
-        tracing::info!(
-            process_type = %args.process_type,
-            process_id = %process_id_parsed,
-            "process would be cancelled here"
-        );
-
-        let message = if let Some(reason) = args.reason {
-            format!("{} {} cancelled: {}", args.process_type, process_id_parsed, reason)
+        let message = if let Some(reason) = &args.reason {
+            format!("{} {} cancelled: {reason}", args.process_type, args.process_id)
         } else {
-            format!("{} {} cancelled.", args.process_type, process_id_parsed)
+            format!("{} {} cancelled.", args.process_type, args.process_id)
         };
 
         Ok(CancelOutput {
@@ -132,24 +119,4 @@ impl Tool for CancelTool {
             message,
         })
     }
-}
-
-/// Legacy function for canceling workers.
-pub async fn cancel_worker(
-    _channel_id: ChannelId,
-    _worker_id: WorkerId,
-) -> anyhow::Result<()> {
-    tracing::warn!("cancel_worker called without event_tx - use CancelTool instead");
-    tracing::info!("worker would be cancelled here");
-    Ok(())
-}
-
-/// Legacy function for canceling branches.
-pub async fn cancel_branch(
-    _channel_id: ChannelId,
-    _branch_id: BranchId,
-) -> anyhow::Result<()> {
-    tracing::warn!("cancel_branch called without event_tx - use CancelTool instead");
-    tracing::info!("branch would be cancelled here");
-    Ok(())
 }

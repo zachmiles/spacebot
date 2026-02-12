@@ -42,6 +42,8 @@ impl LlmManager {
                 .ok_or_else(|| LlmError::MissingProviderKey("anthropic".into()).into()),
             "openai" => self.config.openai_key.clone()
                 .ok_or_else(|| LlmError::MissingProviderKey("openai".into()).into()),
+            "openrouter" => self.config.openrouter_key.clone()
+                .ok_or_else(|| LlmError::MissingProviderKey("openrouter".into()).into()),
             _ => Err(LlmError::UnknownProvider(provider.into()).into()),
         }
     }

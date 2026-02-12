@@ -65,6 +65,7 @@ impl SpacebotModel {
         match self.provider.as_str() {
             "anthropic" => self.call_anthropic(request).await,
             "openai" => self.call_openai(request).await,
+            "openrouter" => self.call_openrouter(request).await,
             other => Err(CompletionError::ProviderError(format!(
                 "unknown provider: {other}"
             ))),
@@ -79,7 +80,12 @@ impl CompletionModel for SpacebotModel {
 
     fn make(client: &Self::Client, model: impl Into<String>) -> Self {
         let full_name = model.into();
-        let (provider, model_name) = if let Some((p, m)) = full_name.split_once('/') {
+
+        // OpenRouter model names have the form "openrouter/provider/model",
+        // so split on the first "/" only and keep the rest as the model name.
+        let (provider, model_name) = if let Some(rest) = full_name.strip_prefix("openrouter/") {
+            ("openrouter".to_string(), rest.to_string())
+        } else if let Some((p, m)) = full_name.split_once('/') {
             (p.to_string(), m.to_string())
         } else {
             ("anthropic".to_string(), full_name.clone())
@@ -338,6 +344,89 @@ impl SpacebotModel {
             )));
         }
 
+        parse_openai_response(response_body)
+    }
+
+    async fn call_openrouter(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let api_key = self
+            .llm_manager
+            .get_api_key("openrouter")
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        // OpenRouter uses the OpenAI chat completions format.
+        // model_name is the full OpenRouter model ID (e.g. "anthropic/claude-sonnet-4-20250514").
+        let mut messages = Vec::new();
+
+        if let Some(preamble) = &request.preamble {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": preamble,
+            }));
+        }
+
+        messages.extend(convert_messages_to_openai(&request.chat_history));
+
+        let mut body = serde_json::json!({
+            "model": self.model_name,
+            "messages": messages,
+        });
+
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let response = self
+            .llm_manager
+            .http_client()
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        if !status.is_success() {
+            let message = response_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(CompletionError::ProviderError(format!(
+                "OpenRouter API error ({status}): {message}"
+            )));
+        }
+
+        // OpenRouter returns OpenAI-format responses
         parse_openai_response(response_body)
     }
 }
