@@ -16,7 +16,7 @@ use teloxide::types::{
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 
@@ -44,13 +44,52 @@ struct ActiveStream {
 /// Telegram's per-message character limit.
 const MAX_MESSAGE_LENGTH: usize = 4096;
 
+const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u32 = 30;
+const TELEGRAM_HTTP_TIMEOUT: Duration = Duration::from_secs(35);
+const TELEGRAM_GET_UPDATES_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Minimum interval between streaming edits to avoid rate limits.
-const STREAM_EDIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+const STREAM_EDIT_INTERVAL: Duration = Duration::from_millis(1000);
+
+fn build_telegram_http_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(TELEGRAM_HTTP_TIMEOUT)
+        .tcp_nodelay(true);
+
+    const TELOXIDE_PROXY: &str = "TELOXIDE_PROXY";
+
+    if let Ok(proxy) = std::env::var(TELOXIDE_PROXY) {
+        match reqwest::Proxy::all(proxy) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "invalid TELOXIDE_PROXY URL; using direct Telegram connection"
+                );
+            }
+        }
+    }
+
+    match builder.build() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to create telegram reqwest client with custom timeout, falling back to default client"
+            );
+            reqwest::Client::new()
+        }
+    }
+}
 
 impl TelegramAdapter {
     pub fn new(token: impl Into<String>, permissions: Arc<ArcSwap<TelegramPermissions>>) -> Self {
         let token = token.into();
-        let bot = Bot::new(&token);
+        let http_client = build_telegram_http_client();
+        let bot = Bot::with_client(token, http_client);
         Self {
             permissions,
             bot,
@@ -128,12 +167,29 @@ impl Messaging for TelegramAdapter {
                         tracing::info!("telegram polling loop shutting down");
                         break;
                     }
-                    result = bot.get_updates().offset(offset).timeout(30).send() => {
+                    result = async {
+                        let request_started = Instant::now();
+                        let result = bot
+                            .get_updates()
+                            .offset(offset)
+                            .timeout(TELEGRAM_LONG_POLL_TIMEOUT_SECS)
+                            .send()
+                            .await;
+                        (request_started, result)
+                    } => {
+                        let (request_started, result) = result;
                         let updates = match result {
                             Ok(updates) => updates,
                             Err(error) => {
-                                tracing::error!(%error, "telegram getUpdates failed");
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                tracing::error!(
+                                    %error,
+                                    elapsed_ms = request_started.elapsed().as_millis(),
+                                    poll_timeout_secs = TELEGRAM_LONG_POLL_TIMEOUT_SECS,
+                                    http_timeout_secs = TELEGRAM_HTTP_TIMEOUT.as_secs(),
+                                    retry_delay_secs = TELEGRAM_GET_UPDATES_RETRY_DELAY.as_secs(),
+                                    "telegram getUpdates failed"
+                                );
+                                tokio::time::sleep(TELEGRAM_GET_UPDATES_RETRY_DELAY).await;
                                 continue;
                             }
                         };
@@ -726,4 +782,16 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_http_timeout_is_greater_than_long_poll_timeout() {
+        assert!(
+            TELEGRAM_HTTP_TIMEOUT > Duration::from_secs(TELEGRAM_LONG_POLL_TIMEOUT_SECS as u64)
+        );
+    }
 }
