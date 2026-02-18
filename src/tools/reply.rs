@@ -6,7 +6,10 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
+
+use super::skip::SkipFlag;
 
 /// Tool for replying to users.
 ///
@@ -20,6 +23,7 @@ pub struct ReplyTool {
     conversation_id: String,
     conversation_logger: ConversationLogger,
     channel_id: ChannelId,
+    skip_flag: SkipFlag,
 }
 
 impl ReplyTool {
@@ -29,12 +33,14 @@ impl ReplyTool {
         conversation_id: impl Into<String>,
         conversation_logger: ConversationLogger,
         channel_id: ChannelId,
+        skip_flag: SkipFlag,
     ) -> Self {
         Self {
             response_tx,
             conversation_id: conversation_id.into(),
             conversation_logger,
             channel_id,
+            skip_flag,
         }
     }
 }
@@ -123,6 +129,8 @@ impl Tool for ReplyTool {
             .send(response)
             .await
             .map_err(|e| ReplyError(format!("failed to send reply: {e}")))?;
+
+        self.skip_flag.store(true, Ordering::Relaxed);
 
         tracing::debug!(conversation_id = %self.conversation_id, "reply sent to outbound channel");
 
