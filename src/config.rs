@@ -1,6 +1,6 @@
 //! Configuration loading and validation.
 
-use crate::error::{ConfigError, Result};
+use crate::error::Result;
 use crate::llm::routing::RoutingConfig;
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
@@ -68,9 +68,9 @@ pub struct LlmConfig {
 impl LlmConfig {
     /// Check if any provider key is configured.
     pub fn has_any_key(&self) -> bool {
-        self.anthropic_key.is_some() 
-            || self.openai_key.is_some() 
-            || self.openrouter_key.is_some() 
+        self.anthropic_key.is_some()
+            || self.openai_key.is_some()
+            || self.openrouter_key.is_some()
             || self.zhipu_key.is_some()
             || self.groq_key.is_some()
             || self.together_key.is_some()
@@ -1244,8 +1244,8 @@ impl Config {
     /// Validate a raw TOML string as a valid Spacebot config.
     /// Returns Ok(()) if the config is structurally valid, or an error describing what's wrong.
     pub fn validate_toml(content: &str) -> Result<()> {
-        let toml_config: TomlConfig = toml::from_str(content)
-            .context("failed to parse config TOML")?;
+        let toml_config: TomlConfig =
+            toml::from_str(content).context("failed to parse config TOML")?;
         // Run full conversion to catch semantic errors (env resolution, defaults, etc.)
         let instance_dir = Self::default_instance_dir();
         Self::from_toml(toml_config, instance_dir)?;
@@ -1944,7 +1944,9 @@ pub fn spawn_file_watcher(
                     // Only forward data modification events, not metadata/access changes
                     use notify::EventKind;
                     match &event.kind {
-                        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Data(_)) | EventKind::Remove(_) => {
+                        EventKind::Create(_)
+                        | EventKind::Modify(notify::event::ModifyKind::Data(_))
+                        | EventKind::Remove(_) => {
                             let _ = tx.send(event);
                         }
                         // Also forward Any/Other modify events (some backends don't distinguish)
